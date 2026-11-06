@@ -3,12 +3,7 @@
 #  Google AI Pro — Termux/Android installer
 #  Runs INSIDE Termux (not inside proot-distro)
 #
-#  What this does:
-#    1. Updates Termux packages
-#    2. Installs proot-distro (Ubuntu 22.04 container, no root)
-#    3. Inside proot Ubuntu: installs Python 3, Chromium, Playwright
-#
-#  Usage (from Termux):
+#  Usage:
 #    chmod +x termux_install.sh && bash termux_install.sh
 # ============================================================
 set -e
@@ -33,7 +28,6 @@ proot-distro install "$DISTRO" 2>/dev/null || echo "  (already installed, skippi
 # ── 3. Inside proot: system packages ────────────────────────
 echo "[3/4] Installing system packages inside proot-distro Ubuntu..."
 proot-distro login "$DISTRO" -- bash -c "
-    set -e
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq \
@@ -51,18 +45,24 @@ proot-distro login "$DISTRO" -- bash -c "
 echo "[4/4] Installing Python packages inside proot-distro Ubuntu..."
 proot-distro login "$DISTRO" -- bash -c "
     set -e
-    pip3 install --quiet --upgrade pip
-    pip3 install --quiet fastapi uvicorn 'playwright>=1.40.0' pydantic
 
-    # Use system chromium-browser if available; otherwise download Playwright's ARM64 Chromium
+    # Ubuntu 23.04+ uses PEP 668 (externally managed). Use --break-system-packages.
+    # Try with the flag first; if pip is too old to know the flag, try without.
+    pip3 install --break-system-packages --quiet \
+        fastapi uvicorn 'playwright>=1.40.0' pydantic 2>/dev/null \
+    || pip3 install --quiet \
+        fastapi uvicorn 'playwright>=1.40.0' pydantic
+
+    # Install Playwright's ARM64 Chromium if system chromium-browser is absent
     if command -v chromium-browser &>/dev/null; then
-        echo '  Using system chromium-browser. Installing browser deps...'
+        echo '  Using system chromium-browser'
         PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 playwright install-deps chromium 2>/dev/null || true
     else
-        echo '  Installing Playwright Chromium for ARM64 (~250 MB)...'
+        echo '  Downloading Playwright Chromium for ARM64 (~250 MB)...'
         playwright install chromium
         playwright install-deps chromium 2>/dev/null || true
     fi
+
     echo '  Python packages OK'
 "
 
