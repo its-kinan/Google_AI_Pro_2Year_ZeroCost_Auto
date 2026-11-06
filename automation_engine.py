@@ -14,15 +14,40 @@ from typing import Callable, Dict, Any, Optional
 from playwright.async_api import async_playwright
 
 def _find_chrome_path() -> str:
-    candidates = [
+    # Honour explicit override first
+    env_bin = os.environ.get("CHROME_BIN") or os.environ.get("CHROME_PATH")
+    if env_bin and os.path.isfile(env_bin):
+        return env_bin
+
+    import glob, shutil
+    # Linux: prefer CloakBrowser stealth Chromium (same binary used by gemini2api/antigravity)
+    linux_glob_candidates = [
+        os.path.expanduser("~/.anvil/.cloakbrowser/chromium-*/chrome"),
+        os.path.expanduser("~/.cloakbrowser/chromium-*/chrome"),
+        "/home/ubuntu/.anvil/.cloakbrowser/chromium-*/chrome",
+        "/root/.cloakbrowser/chromium-*/chrome",
+    ]
+    for pat in linux_glob_candidates:
+        matches = sorted(glob.glob(pat))
+        if matches and os.path.isfile(matches[-1]):
+            return matches[-1]
+
+    # System Chrome / Chromium fallbacks
+    for cmd in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        found = shutil.which(cmd)
+        if found:
+            return found
+
+    # Windows fallbacks (kept for completeness — no-op on Linux)
+    win_candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
     ]
-    for p in candidates:
+    for p in win_candidates:
         if os.path.exists(p):
             return p
-    return candidates[0]
+    return win_candidates[0]
 
 
 CHROME_PATH = _find_chrome_path()
@@ -1705,6 +1730,36 @@ class GoogleUltraAutomator:
         resolved_proxy = resolve_account_proxy(self.account, self.target_region, self.proxy_template)
         parsed_proxy = parse_proxy_string(resolved_proxy)
 
+        # ── Linux: ensure a virtual display is active ──────────────────────────
+        _display_env: Optional[str] = None
+        if os.name != "nt":
+            import shutil as _shutil, socket as _sock
+            xvfb_bin = _shutil.which("Xvfb")
+            if xvfb_bin:
+                # find a free display number
+                def _disp_busy(n: int) -> bool:
+                    sock_path = f"/tmp/.X11-unix/X{n}"
+                    lock_path = f"/tmp/.X{n}-lock"
+                    if os.path.exists(sock_path) or os.path.exists(lock_path):
+                        return True
+                    return False
+                disp_num = next((n for n in range(99, 150) if not _disp_busy(n)), 99)
+                _display_env = f":{disp_num}"
+                _xvfb_proc = subprocess.Popen(
+                    [xvfb_bin, _display_env, "-screen", "0", "1920x1080x24", "-ac", "-noreset"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                # wait up to 3s for the socket
+                for _ in range(30):
+                    if os.path.exists(f"/tmp/.X11-unix/X{disp_num}"):
+                        break
+                    time.sleep(0.1)
+                self.log(f"🖥️ 虚拟显示器已启动 (Xvfb {_display_env})")
+                # stash for cleanup
+                self._xvfb_proc = _xvfb_proc
+            else:
+                _display_env = os.environ.get("DISPLAY", ":0")
+
         chrome_args = [
             CHROME_PATH,
             f"--remote-debugging-port={self.port}",
@@ -1721,6 +1776,15 @@ class GoogleUltraAutomator:
             "--enforce-webrtc-ip-permission-check",
             "--start-maximized",
         ]
+        # Linux-specific stealth / sandbox flags
+        if os.name != "nt":
+            chrome_args += [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--ignore-certificate-errors",
+            ]
 
         if parsed_proxy:
             if parsed_proxy.get("username"):
@@ -1742,16 +1806,32 @@ class GoogleUltraAutomator:
 
         # Cleanly kill any lingering process listening on self.port
         try:
-            net_out = subprocess.check_output(f"netstat -ano | findstr :{self.port}", shell=True).decode("gbk", errors="ignore")
-            for line in net_out.splitlines():
-                if "LISTENING" in line:
-                    old_pid = line.strip().split()[-1]
-                    subprocess.run(f"taskkill /F /T /PID {old_pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.name == "nt":
+                net_out = subprocess.check_output(f"netstat -ano | findstr :{self.port}", shell=True).decode("gbk", errors="ignore")
+                for line in net_out.splitlines():
+                    if "LISTENING" in line:
+                        old_pid = line.strip().split()[-1]
+                        subprocess.run(f"taskkill /F /T /PID {old_pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                # Linux: lsof-based port kill
+                try:
+                    pids_out = subprocess.check_output(["fuser", f"{self.port}/tcp"], stderr=subprocess.DEVNULL).decode().strip()
+                    for pid_str in pids_out.split():
+                        try:
+                            subprocess.run(["kill", "-9", pid_str.strip()], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception:
             pass
         await asyncio.sleep(0.8)
 
-        self.proc = subprocess.Popen(chrome_args)
+        # Build subprocess env — inject DISPLAY for Linux Xvfb
+        launch_env = os.environ.copy()
+        if _display_env:
+            launch_env["DISPLAY"] = _display_env
+        self.proc = subprocess.Popen(chrome_args, env=launch_env)
         await asyncio.sleep(2.8)
 
         try:
@@ -1789,6 +1869,21 @@ class GoogleUltraAutomator:
                 await self.proxy_bridge.stop()
             if self.proc:
                 try:
-                    subprocess.run(f"taskkill /F /T /PID {self.proc.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if os.name == "nt":
+                        subprocess.run(f"taskkill /F /T /PID {self.proc.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        self.proc.kill()
+                        self.proc.wait(timeout=5)
                 except Exception:
                     pass
+            # Clean up Xvfb on Linux
+            xvfb_p = getattr(self, "_xvfb_proc", None)
+            if xvfb_p is not None:
+                try:
+                    xvfb_p.terminate()
+                    xvfb_p.wait(timeout=3)
+                except Exception:
+                    try:
+                        xvfb_p.kill()
+                    except Exception:
+                        pass

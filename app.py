@@ -404,8 +404,9 @@ MANUAL_BRIDGES: Dict[str, LocalHttpProxyAuthBridge] = {}
 
 def _launch_on_interactive_desktop(args: List[str]):
     """
-    Launch a GUI process (e.g. Chrome) explicitly onto the user's interactive desktop (winsta0\\default)
-    even if the backend server was started inside an isolated/background desktop session (e.g. exebox).
+    Launch a GUI process (Chrome) onto the interactive desktop.
+    On Windows: uses CreateProcessW with winsta0\\default.
+    On Linux: runs under the current/Xvfb DISPLAY, adding required sandbox flags.
     """
     if os.name == "nt":
         try:
@@ -468,7 +469,15 @@ def _launch_on_interactive_desktop(args: List[str]):
                 return
         except Exception:
             pass
-    subprocess.Popen(args)
+        subprocess.Popen(args)
+    else:
+        # Linux: inject sandbox flags and ensure DISPLAY is set
+        linux_flags = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        final_args = [args[0]] + linux_flags + [a for a in args[1:] if a not in linux_flags]
+        env = os.environ.copy()
+        if not env.get("DISPLAY"):
+            env["DISPLAY"] = ":0"
+        subprocess.Popen(final_args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 @app.post("/api/open_browser")
