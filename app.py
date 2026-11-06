@@ -18,6 +18,8 @@ from automation_engine import (
     get_profile_dir,
     resolve_account_proxy,
     parse_proxy_string,
+    IS_ANDROID,
+    IS_WINDOWS,
     CHROME_PATH,
     BASE_DIR,
     SCREENSHOTS_DIR,
@@ -405,10 +407,27 @@ MANUAL_BRIDGES: Dict[str, LocalHttpProxyAuthBridge] = {}
 def _launch_on_interactive_desktop(args: List[str]):
     """
     Launch a GUI process (Chrome) onto the interactive desktop.
-    On Windows: uses CreateProcessW with winsta0\\default.
-    On Linux: runs under the current/Xvfb DISPLAY, adding required sandbox flags.
+    - Windows: uses CreateProcessW with winsta0\\default
+    - Linux desktop: standard Popen with DISPLAY
+    - Android/proot: open via Android `am` intent (shows Chrome on screen)
     """
-    if os.name == "nt":
+    if IS_ANDROID:
+        # On Android, open Chrome via Activity Manager intent — shows to user on screen
+        # args[0] is the chromium binary path; extract any URL args
+        urls = [a for a in args if a.startswith("http")]
+        url = urls[0] if urls else "https://one.google.com/plans"
+        subprocess.Popen(
+            [
+                "am", "start",
+                "-a", "android.intent.action.VIEW",
+                "-d", url,
+                "-n", "com.android.chrome/com.google.android.apps.chrome.Main",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return
+
+    if IS_WINDOWS:
         try:
             import ctypes
             import ctypes.wintypes as wt
@@ -452,16 +471,9 @@ def _launch_on_interactive_desktop(args: List[str]):
             cmd_str = subprocess.list2cmdline(args)
             cmd_buf = ctypes.create_unicode_buffer(cmd_str)
             ok = ctypes.windll.kernel32.CreateProcessW(
-                None,
-                cmd_buf,
-                None,
-                None,
-                False,
-                0x00000010,  # CREATE_NEW_CONSOLE
-                None,
-                None,
-                ctypes.byref(si),
-                ctypes.byref(pi),
+                None, cmd_buf, None, None, False,
+                0x00000010, None, None,
+                ctypes.byref(si), ctypes.byref(pi),
             )
             if ok:
                 ctypes.windll.kernel32.CloseHandle(pi.hThread)
@@ -471,7 +483,7 @@ def _launch_on_interactive_desktop(args: List[str]):
             pass
         subprocess.Popen(args)
     else:
-        # Linux: inject sandbox flags and ensure DISPLAY is set
+        # Linux desktop: inject sandbox flags and ensure DISPLAY is set
         linux_flags = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         final_args = [args[0]] + linux_flags + [a for a in args[1:] if a not in linux_flags]
         env = os.environ.copy()

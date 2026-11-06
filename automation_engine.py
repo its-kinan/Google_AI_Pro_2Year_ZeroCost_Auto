@@ -13,6 +13,29 @@ import time
 from typing import Callable, Dict, Any, Optional
 from playwright.async_api import async_playwright
 
+def _is_android() -> bool:
+    """Return True when running inside Termux or a proot-distro container on Android."""
+    # Termux native: PREFIX env points into /data/data/com.termux
+    prefix = os.environ.get("PREFIX", "")
+    if "com.termux" in prefix:
+        return True
+    # proot-distro Ubuntu on Android: /proc/version contains 'android' in kernel string
+    try:
+        with open("/proc/version") as fv:
+            if "android" in fv.read().lower():
+                return True
+    except Exception:
+        pass
+    # Fallback: ANDROID_ROOT is set on real Android
+    if os.environ.get("ANDROID_ROOT"):
+        return True
+    return False
+
+
+IS_ANDROID = _is_android()
+IS_WINDOWS = os.name == "nt"
+
+
 def _find_chrome_path() -> str:
     # Honour explicit override first
     env_bin = os.environ.get("CHROME_BIN") or os.environ.get("CHROME_PATH")
@@ -20,25 +43,49 @@ def _find_chrome_path() -> str:
         return env_bin
 
     import glob, shutil
-    # Linux: prefer CloakBrowser stealth Chromium (same binary used by gemini2api/antigravity)
-    linux_glob_candidates = [
-        os.path.expanduser("~/.anvil/.cloakbrowser/chromium-*/chrome"),
-        os.path.expanduser("~/.cloakbrowser/chromium-*/chrome"),
-        "/home/ubuntu/.anvil/.cloakbrowser/chromium-*/chrome",
-        "/root/.cloakbrowser/chromium-*/chrome",
-    ]
-    for pat in linux_glob_candidates:
-        matches = sorted(glob.glob(pat))
-        if matches and os.path.isfile(matches[-1]):
-            return matches[-1]
 
-    # System Chrome / Chromium fallbacks
-    for cmd in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
-        found = shutil.which(cmd)
-        if found:
-            return found
+    if IS_ANDROID:
+        # Android / proot-distro Ubuntu paths
+        android_candidates = [
+            # proot-distro Ubuntu (Playwright installs to ~/.cache/ms-playwright inside proot)
+            os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
+            # System chromium inside proot-distro Ubuntu on Android
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            # Termux chromium (rare but possible)
+            "/data/data/com.termux/files/usr/bin/chromium-browser",
+        ]
+        for pat in android_candidates:
+            if "*" in pat:
+                matches = sorted(glob.glob(pat))
+                if matches and os.path.isfile(matches[-1]):
+                    return matches[-1]
+            elif os.path.isfile(pat):
+                return pat
+        # fall through to shutil.which
+        for cmd in ("chromium-browser", "chromium", "google-chrome"):
+            found = shutil.which(cmd)
+            if found:
+                return found
 
-    # Windows fallbacks (kept for completeness — no-op on Linux)
+    if not IS_WINDOWS:
+        # Linux desktop: prefer CloakBrowser stealth Chromium
+        linux_glob_candidates = [
+            os.path.expanduser("~/.anvil/.cloakbrowser/chromium-*/chrome"),
+            os.path.expanduser("~/.cloakbrowser/chromium-*/chrome"),
+            "/home/ubuntu/.anvil/.cloakbrowser/chromium-*/chrome",
+            "/root/.cloakbrowser/chromium-*/chrome",
+        ]
+        for pat in linux_glob_candidates:
+            matches = sorted(glob.glob(pat))
+            if matches and os.path.isfile(matches[-1]):
+                return matches[-1]
+        for cmd in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+            found = shutil.which(cmd)
+            if found:
+                return found
+
+    # Windows fallbacks
     win_candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -1730,36 +1777,37 @@ class GoogleUltraAutomator:
         resolved_proxy = resolve_account_proxy(self.account, self.target_region, self.proxy_template)
         parsed_proxy = parse_proxy_string(resolved_proxy)
 
-        # ── Linux: ensure a virtual display is active ──────────────────────────
+        # ── Platform-specific display / headless setup ──────────────────────────
         _display_env: Optional[str] = None
-        if os.name != "nt":
-            import shutil as _shutil, socket as _sock
+
+        if IS_ANDROID:
+            # Android / proot-distro: use --headless=new, no Xvfb needed
+            self.log("📱 Android/Termux 模式: 使用 Chromium headless=new (无需 Xvfb)")
+        elif not IS_WINDOWS:
+            # Linux desktop: start Xvfb if available
+            import shutil as _shutil
             xvfb_bin = _shutil.which("Xvfb")
             if xvfb_bin:
-                # find a free display number
                 def _disp_busy(n: int) -> bool:
                     sock_path = f"/tmp/.X11-unix/X{n}"
                     lock_path = f"/tmp/.X{n}-lock"
-                    if os.path.exists(sock_path) or os.path.exists(lock_path):
-                        return True
-                    return False
+                    return os.path.exists(sock_path) or os.path.exists(lock_path)
                 disp_num = next((n for n in range(99, 150) if not _disp_busy(n)), 99)
                 _display_env = f":{disp_num}"
                 _xvfb_proc = subprocess.Popen(
                     [xvfb_bin, _display_env, "-screen", "0", "1920x1080x24", "-ac", "-noreset"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-                # wait up to 3s for the socket
                 for _ in range(30):
                     if os.path.exists(f"/tmp/.X11-unix/X{disp_num}"):
                         break
                     time.sleep(0.1)
                 self.log(f"🖥️ 虚拟显示器已启动 (Xvfb {_display_env})")
-                # stash for cleanup
                 self._xvfb_proc = _xvfb_proc
             else:
                 _display_env = os.environ.get("DISPLAY", ":0")
 
+        # ── Build Chrome/Chromium launch args ───────────────────────────────────
         chrome_args = [
             CHROME_PATH,
             f"--remote-debugging-port={self.port}",
@@ -1774,17 +1822,37 @@ class GoogleUltraAutomator:
             "--no-pings",
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--enforce-webrtc-ip-permission-check",
-            "--start-maximized",
         ]
-        # Linux-specific stealth / sandbox flags
-        if os.name != "nt":
+
+        if IS_ANDROID:
+            # Android/proot: headless with mobile UA to avoid HeadlessChrome detection
+            chrome_args += [
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--ignore-certificate-errors",
+                "--window-size=1280,900",
+                (
+                    "--user-agent=Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Mobile Safari/537.36"
+                ),
+                "--js-flags=--max-old-space-size=512",
+            ]
+        elif not IS_WINDOWS:
+            # Linux desktop
             chrome_args += [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--ignore-certificate-errors",
+                "--start-maximized",
             ]
+        else:
+            chrome_args.append("--start-maximized")
 
         if parsed_proxy:
             if parsed_proxy.get("username"):
@@ -1806,39 +1874,57 @@ class GoogleUltraAutomator:
 
         # Cleanly kill any lingering process listening on self.port
         try:
-            if os.name == "nt":
+            if IS_WINDOWS:
                 net_out = subprocess.check_output(f"netstat -ano | findstr :{self.port}", shell=True).decode("gbk", errors="ignore")
                 for line in net_out.splitlines():
                     if "LISTENING" in line:
                         old_pid = line.strip().split()[-1]
                         subprocess.run(f"taskkill /F /T /PID {old_pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                # Linux: lsof-based port kill
-                try:
-                    pids_out = subprocess.check_output(["fuser", f"{self.port}/tcp"], stderr=subprocess.DEVNULL).decode().strip()
-                    for pid_str in pids_out.split():
-                        try:
+                # Linux + Android: try fuser first, fall back to ss + kill
+                import shutil as _sh
+                if _sh.which("fuser"):
+                    try:
+                        pids_out = subprocess.check_output(["fuser", f"{self.port}/tcp"], stderr=subprocess.DEVNULL).decode().strip()
+                        for pid_str in pids_out.split():
                             subprocess.run(["kill", "-9", pid_str.strip()], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                else:
+                    # Termux / Android fallback: ss -tlnp to find PID then kill it
+                    try:
+                        ss_out = subprocess.check_output(["ss", "-tlnp", f"sport = :{self.port}"], stderr=subprocess.DEVNULL).decode()
+                        for m in re.findall(r"pid=(\d+)", ss_out):
+                            subprocess.run(["kill", "-9", m], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
         except Exception:
             pass
         await asyncio.sleep(0.8)
 
-        # Build subprocess env — inject DISPLAY for Linux Xvfb
+        # Build subprocess env — inject DISPLAY for Linux desktop Xvfb
         launch_env = os.environ.copy()
         if _display_env:
             launch_env["DISPLAY"] = _display_env
-        self.proc = subprocess.Popen(chrome_args, env=launch_env)
+        self.proc = subprocess.Popen(
+            chrome_args, env=launch_env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         await asyncio.sleep(2.8)
 
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{self.port}")
                 context = browser.contexts[0]
-                await context.add_init_script("window.__INIT_TEST = null;\n" + HOOK_JS)
+                await context.add_init_script(
+                    "window.__INIT_TEST = null;\n"
+                    + HOOK_JS
+                    + (
+                        # Android headless: clear webdriver flag before every page load
+                        "\nObject.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                        if IS_ANDROID else ""
+                    )
+                )
 
                 page = context.pages[0] if context.pages else await context.new_page()
                 await page.set_viewport_size({"width": 1400, "height": 950})

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+profiles/
+screenshots/
+server.log
+.server.pid
+config.json
