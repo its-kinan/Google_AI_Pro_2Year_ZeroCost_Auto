@@ -1,10 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 #  Google AI Pro — Termux/Android installer
-#  Runs INSIDE Termux (not inside proot-distro)
-#
-#  Usage:
-#    chmod +x termux_install.sh && bash termux_install.sh
+#  Usage: bash termux_install.sh
 # ============================================================
 set -e
 
@@ -27,50 +24,60 @@ proot-distro install "$DISTRO" 2>/dev/null || echo "  (already installed, skippi
 
 # ── 3. Inside proot: system packages ────────────────────────
 echo "[3/4] Installing system packages inside proot-distro Ubuntu..."
-proot-distro login "$DISTRO" -- bash -c "
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq \
-        python3 python3-pip python3-venv \
-        chromium-browser \
-        libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-        libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-        libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 \
-        fonts-liberation fonts-noto-cjk \
-        2>/dev/null || true
-    echo '  system packages OK'
-"
+proot-distro login "$DISTRO" -- bash << 'PROOT_SYS'
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq \
+    python3 python3-pip python3-venv \
+    chromium-browser \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+    libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 \
+    fonts-liberation fonts-noto-cjk \
+    2>/dev/null || true
+echo "  system packages OK"
+PROOT_SYS
 
-# ── 4. Inside proot: Python packages ────────────────────────
+# ── 4. Inside proot: Python packages via venv ───────────────
 echo "[4/4] Installing Python packages inside proot-distro Ubuntu..."
-proot-distro login "$DISTRO" -- bash -c "
-    set -e
+proot-distro login "$DISTRO" -- bash << 'PROOT_PY'
+set -e
 
-    # Ubuntu 23.04+ uses PEP 668 (externally managed). Use --break-system-packages.
-    # Try with the flag first; if pip is too old to know the flag, try without.
-    pip3 install --break-system-packages --quiet \
-        fastapi uvicorn 'playwright>=1.40.0' pydantic 2>/dev/null \
-    || pip3 install --quiet \
-        fastapi uvicorn 'playwright>=1.40.0' pydantic
+VENV=/root/venv-google-ai
 
-    # Install Playwright's ARM64 Chromium if system chromium-browser is absent
-    if command -v chromium-browser &>/dev/null; then
-        echo '  Using system chromium-browser'
-        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 playwright install-deps chromium 2>/dev/null || true
-    else
-        echo '  Downloading Playwright Chromium for ARM64 (~250 MB)...'
-        playwright install chromium
-        playwright install-deps chromium 2>/dev/null || true
-    fi
+# Create venv — this gives us a fresh pip that understands manylinux_2_17_aarch64
+python3 -m venv "$VENV"
+source "$VENV/bin/activate"
 
-    echo '  Python packages OK'
-"
+# Upgrade pip inside the venv (safe — does not touch system pip)
+pip install --quiet --upgrade pip
+
+# Install packages
+echo "  Installing fastapi, uvicorn, playwright, pydantic..."
+pip install --quiet fastapi uvicorn "playwright>=1.40.0" pydantic
+
+# Debug: show what platform pip detected
+echo "  pip platform: $(python3 -c 'import pip._internal.utils.compatibility_tags as t; print(list(t.get_supported())[0])'  2>/dev/null || echo 'unknown')"
+echo "  playwright version: $(pip show playwright | grep ^Version)"
+
+# Install Chromium — prefer system, fallback to playwright's
+if command -v chromium-browser &>/dev/null; then
+    echo "  Using system chromium-browser"
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 playwright install-deps chromium 2>/dev/null || true
+else
+    echo "  Downloading Playwright Chromium for ARM64 (~250 MB)..."
+    playwright install chromium
+    playwright install-deps chromium 2>/dev/null || true
+fi
+
+echo "  Python packages OK — venv at $VENV"
+PROOT_PY
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  Installation complete!                              ║"
 echo "║                                                      ║"
-echo "║  To run:                                             ║"
+echo "║  To start the server:                                ║"
 echo "║    bash termux_start.sh                              ║"
 echo "║                                                      ║"
 echo "║  Then open in your phone browser:                   ║"

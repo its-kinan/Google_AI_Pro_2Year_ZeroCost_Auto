@@ -6,6 +6,7 @@
 
 DISTRO="ubuntu"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV=/root/venv-google-ai
 
 termux-wake-lock 2>/dev/null || true
 
@@ -23,31 +24,34 @@ if ! command -v proot-distro &>/dev/null; then
     exit 1
 fi
 
-# Check Python packages are installed inside proot
-if ! proot-distro login "$DISTRO" -- python3 -c "import fastapi, uvicorn, playwright" 2>/dev/null; then
-    echo "ERROR: Python packages missing inside proot. Run: bash termux_install.sh first."
+# Check the venv exists (created by termux_install.sh)
+proot-distro login "$DISTRO" -- test -f "$VENV/bin/activate" 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "ERROR: venv not found inside proot ($VENV). Run: bash termux_install.sh first."
     exit 1
 fi
 
-# ── Strategy: bind-mount the repo dir into proot at /google-ai-pro ──
-# Try proot-distro --bind first (proot-distro >= 3.x)
-# Fall back to manual copy inside proot rootfs if --bind unsupported
+echo "App dir : $SCRIPT_DIR"
+echo "Venv    : $VENV (inside proot)"
+echo ""
 
+# ── Try --bind first (proot-distro >= 3.x) ──────────────────
 BIND_OK=false
-proot-distro login "$DISTRO" --bind "$SCRIPT_DIR:/google-ai-pro" -- bash -c "test -f /google-ai-pro/app.py" 2>/dev/null && BIND_OK=true
+proot-distro login "$DISTRO" --bind "$SCRIPT_DIR:/google-ai-pro" \
+    -- test -f /google-ai-pro/app.py 2>/dev/null && BIND_OK=true
 
 if $BIND_OK; then
-    echo "App dir: $SCRIPT_DIR (bind-mounted)"
     exec proot-distro login "$DISTRO" \
         --bind "$SCRIPT_DIR:/google-ai-pro" \
         -- bash -c "
+            source $VENV/bin/activate
             cd /google-ai-pro
             mkdir -p profiles screenshots
             exec python3 app.py
         "
 else
-    # Fallback: find proot rootfs and copy files there
-    echo "proot-distro --bind not supported, copying files..."
+    # ── Fallback: copy files into proot rootfs ───────────────
+    echo "proot-distro --bind not available, copying files..."
     PROOT_ROOT=""
     for TRY in \
         "$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO/root" \
@@ -59,16 +63,14 @@ else
     done
 
     if [ -z "$PROOT_ROOT" ]; then
-        # Last resort: ask proot-distro where the rootfs is
-        PROOT_ROOT=$(proot-distro login "$DISTRO" -- bash -c "echo /root" 2>/dev/null || echo "")
-        # Can't determine path — let user know
-        echo "ERROR: Cannot determine proot rootfs path."
-        echo "Please run manually:"
+        echo "ERROR: Cannot find proot rootfs path."
+        echo "Please open a proot shell manually:"
         echo "  proot-distro login ubuntu"
         echo "  mkdir -p /root/google-ai-pro/templates"
-        echo "  cp (your repo path)/app.py /root/google-ai-pro/"
-        echo "  cp (your repo path)/automation_engine.py /root/google-ai-pro/"
-        echo "  cp (your repo path)/templates/index.html /root/google-ai-pro/templates/"
+        echo "  cp $SCRIPT_DIR/app.py /root/google-ai-pro/"
+        echo "  cp $SCRIPT_DIR/automation_engine.py /root/google-ai-pro/"
+        echo "  cp $SCRIPT_DIR/templates/index.html /root/google-ai-pro/templates/"
+        echo "  source $VENV/bin/activate && python3 /root/google-ai-pro/app.py"
         exit 1
     fi
 
@@ -81,6 +83,7 @@ else
     echo "Files copied to $APP_DST"
 
     exec proot-distro login "$DISTRO" -- bash -c "
+        source $VENV/bin/activate
         cd /root/google-ai-pro
         exec python3 app.py
     "
