@@ -1,18 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 #  Google AI Pro — Termux/Android launcher
-#
-#  Runs the FastAPI server inside proot-distro Ubuntu on port 8765.
-#  Open http://127.0.0.1:8765 in your phone browser after starting.
-#
-#  Usage (from Termux):
-#    bash termux_start.sh
+#  Usage: bash termux_start.sh
 # ============================================================
 
 DISTRO="ubuntu"
-APP_DIR="/root/google-ai-pro"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Keep Termux alive while server runs
 termux-wake-lock 2>/dev/null || true
 
 echo ""
@@ -24,40 +18,70 @@ echo "║  Press Ctrl+C to stop                                ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
-# Check proot-distro is installed
 if ! command -v proot-distro &>/dev/null; then
     echo "ERROR: proot-distro not installed. Run: bash termux_install.sh first."
     exit 1
 fi
 
-# Check app files exist — if not, try to copy from the repo dir
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROOT_ROOT=""
-for TRY_PATH in \
-    "$HOME/.proot-distro/$DISTRO/root" \
-    "$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO/root" \
-    ""; do
-    if [ -n "$TRY_PATH" ] && [ -d "$TRY_PATH" ]; then
-        PROOT_ROOT="$TRY_PATH"
-        break
-    fi
-done
-
-if [ -n "$PROOT_ROOT" ] && [ ! -f "$PROOT_ROOT/google-ai-pro/app.py" ]; then
-    echo "App files not found in proot. Copying now..."
-    mkdir -p "$PROOT_ROOT/google-ai-pro/templates" \
-              "$PROOT_ROOT/google-ai-pro/profiles" \
-              "$PROOT_ROOT/google-ai-pro/screenshots"
-    cp "$SCRIPT_DIR/automation_engine.py" "$PROOT_ROOT/google-ai-pro/" 2>/dev/null || true
-    cp "$SCRIPT_DIR/app.py"               "$PROOT_ROOT/google-ai-pro/" 2>/dev/null || true
-    cp "$SCRIPT_DIR/templates/index.html" "$PROOT_ROOT/google-ai-pro/templates/" 2>/dev/null || true
-    if [ -f "$SCRIPT_DIR/config.json" ]; then
-        cp "$SCRIPT_DIR/config.json" "$PROOT_ROOT/google-ai-pro/" 2>/dev/null || true
-    fi
+# Check Python packages are installed inside proot
+if ! proot-distro login "$DISTRO" -- python3 -c "import fastapi, uvicorn, playwright" 2>/dev/null; then
+    echo "ERROR: Python packages missing inside proot. Run: bash termux_install.sh first."
+    exit 1
 fi
 
-# Start the server inside proot-distro Ubuntu
-proot-distro login "$DISTRO" -- bash -c "
-    cd $APP_DIR
-    exec python3 app.py
-"
+# ── Strategy: bind-mount the repo dir into proot at /google-ai-pro ──
+# Try proot-distro --bind first (proot-distro >= 3.x)
+# Fall back to manual copy inside proot rootfs if --bind unsupported
+
+BIND_OK=false
+proot-distro login "$DISTRO" --bind "$SCRIPT_DIR:/google-ai-pro" -- bash -c "test -f /google-ai-pro/app.py" 2>/dev/null && BIND_OK=true
+
+if $BIND_OK; then
+    echo "App dir: $SCRIPT_DIR (bind-mounted)"
+    exec proot-distro login "$DISTRO" \
+        --bind "$SCRIPT_DIR:/google-ai-pro" \
+        -- bash -c "
+            cd /google-ai-pro
+            mkdir -p profiles screenshots
+            exec python3 app.py
+        "
+else
+    # Fallback: find proot rootfs and copy files there
+    echo "proot-distro --bind not supported, copying files..."
+    PROOT_ROOT=""
+    for TRY in \
+        "$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO/root" \
+        "$HOME/.proot-distro/$DISTRO/root"; do
+        if [ -d "$TRY" ]; then
+            PROOT_ROOT="$TRY"
+            break
+        fi
+    done
+
+    if [ -z "$PROOT_ROOT" ]; then
+        # Last resort: ask proot-distro where the rootfs is
+        PROOT_ROOT=$(proot-distro login "$DISTRO" -- bash -c "echo /root" 2>/dev/null || echo "")
+        # Can't determine path — let user know
+        echo "ERROR: Cannot determine proot rootfs path."
+        echo "Please run manually:"
+        echo "  proot-distro login ubuntu"
+        echo "  mkdir -p /root/google-ai-pro/templates"
+        echo "  cp (your repo path)/app.py /root/google-ai-pro/"
+        echo "  cp (your repo path)/automation_engine.py /root/google-ai-pro/"
+        echo "  cp (your repo path)/templates/index.html /root/google-ai-pro/templates/"
+        exit 1
+    fi
+
+    APP_DST="$PROOT_ROOT/google-ai-pro"
+    mkdir -p "$APP_DST/templates" "$APP_DST/profiles" "$APP_DST/screenshots"
+    cp "$SCRIPT_DIR/automation_engine.py" "$APP_DST/"
+    cp "$SCRIPT_DIR/app.py"               "$APP_DST/"
+    cp "$SCRIPT_DIR/templates/index.html" "$APP_DST/templates/"
+    [ -f "$SCRIPT_DIR/config.json" ] && cp "$SCRIPT_DIR/config.json" "$APP_DST/" || true
+    echo "Files copied to $APP_DST"
+
+    exec proot-distro login "$DISTRO" -- bash -c "
+        cd /root/google-ai-pro
+        exec python3 app.py
+    "
+fi
